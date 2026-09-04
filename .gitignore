@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.gif
+*.mp4
+
+outputs/
+recordings/
+results/
+debug*/
+.cache/
+
+foundationpose/weights/
+foundationpose/demo_data/
+foundationpose/g1/data/
+foundationpose/g1/results/
+
+*.bag
+*.db3
+
+# Editor / manual backups
+*.bak
+*.bak_*
+*.backup*

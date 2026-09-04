@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viva-vive-ultimate"
+version = "0.2.0"
+description = "在 Linux 上直接从 VIVE Wireless Dongle 读取 Ultimate Tracker 6DoF，不需要 SteamVR"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "非商业，源码可见" }
+# 核心链路零第三方依赖：只用 struct / fcntl / select
+dependencies = []
+
+[project.optional-dependencies]
+analysis = ["numpy>=1.24", "scipy>=1.10", "pandas>=2.0", "matplotlib>=3.7"]
+realsense = ["pyrealsense2>=2.50"]
+viz = ["viser>=1.0", "numpy>=1.24"]
+calibration = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-contrib-python>=4.7",
+    "PyYAML>=6.0",
+    "pyrealsense2>=2.50",
+    "viser>=1.0",
+]
+hidapi = ["hid>=1.0.9"]          # 跑 vive_ultimate_tracker_re 原版脚本时才需要
+dev = ["pytest>=7"]
+
+[project.scripts]
+vvu-monitor = "viva_vive_ultimate.cli.monitor:main"
+vvu-capture = "viva_vive_ultimate.cli.capture:main"
+vvu-sniff   = "viva_vive_ultimate.cli.sniff:main"
+vvu-bench   = "viva_vive_ultimate.cli.bench:main"
+vvu-sync    = "viva_vive_ultimate.cli.sync:main"
+vvu-viz     = "viva_vive_ultimate.cli.viz:main"
+vvu-frame   = "viva_vive_ultimate.cli.frame:main"
+vvu-datum   = "viva_vive_ultimate.cli.datum:main"
+vvu-safety  = "viva_vive_ultimate.safety:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

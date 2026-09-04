@@ -1,0 +1,30 @@
+{
+  "note": "PLACEHOLDER software-only values. Replace T_robot_camera and interaction priors with measured/validated values later.",
+  "T_robot_camera": [
+    [0.0, 0.0, 1.0, 0.10],
+    [-1.0, 0.0, 0.0, 0.00],
+    [0.0, -1.0, 0.0, 1.20],
+    [0.0, 0.0, 0.0, 1.00]
+  ],
+  "demo_T_camera_box": [
+    [1.0, 0.0, 0.0, 0.00],
+    [0.0, 1.0, 0.0, 0.50],
+    [0.0, 0.0, 1.0, 0.90],
+    [0.0, 0.0, 0.0, 1.00]
+  ],
+  "current_root": {
+    "xyz": [0.0, 0.0, 0.78],
+    "rpy": [0.0, 0.0, 0.0]
+  },
+  "stand_height_m": 0.78,
+  "interaction_priors": [
+    {"name": "front_045", "distance_m": 0.45, "lateral_m": 0.00, "grasp_root_height_m": 0.58},
+    {"name": "front_left_050", "distance_m": 0.50, "lateral_m": 0.08, "grasp_root_height_m": 0.60},
+    {"name": "front_right_050", "distance_m": 0.50, "lateral_m": -0.08, "grasp_root_height_m": 0.60}
+  ],
+  "trajectory": {
+    "hz": 50.0,
+    "max_linear_mps": 0.30,
+    "max_angular_radps": 1.00
+  }
+}

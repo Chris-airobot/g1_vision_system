@@ -1,0 +1,24 @@
+{
+  "dictionary": "DICT_APRILTAG_36h11",
+  "marker_id": 45,
+  "marker_size_m": 0.096,
+  "box_dimensions_m": [0.40, 0.30, 0.30],
+  "measured_face_offsets_mm": {
+    "top": 75.0,
+    "bottom": 95.0,
+    "left": 113.0,
+    "right": 110.0
+  },
+  "computed_tag_center_offset_on_face_mm": {
+    "right_positive": 1.5,
+    "up_positive": 10.0
+  },
+  "T_tag_box": [
+    [0.0, 1.0, 0.0, -0.0015],
+    [0.0, 0.0, 1.0, -0.0100],
+    [1.0, 0.0, 0.0, -0.2000],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "frame_assumption": "Tag is mounted on the +X 30x30 cm box face. Tag +x points right on the face, tag +y points up, tag +z points outward toward the camera. Therefore box +X=tag +z, box +Y=tag +x, box +Z=tag +y. Box center is 200 mm behind the tag plane. In-plane center offset uses only opposite-edge differences, so it does not depend on the inconsistent summed gaps.",
+  "note": "Measured tag family/id/size are now configured. The face/orientation convention above must be visually validated once: the AprilTag-derived box overlay should coincide with the physical box. If it appears on the wrong side or rotated, change only T_tag_box orientation/signs, not marker id/size. AprilTag is a reference estimate, not perfect ground truth."
+}
