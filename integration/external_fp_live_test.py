@@ -125,7 +125,7 @@ def main():
     print("External D435i live FoundationPose")
     print("Serial:", SERIAL)
     print("Q = quit")
-    print("Green = 40x30x30 cm FoundationPose box")
+    print("Green = 30x30x30 cm FoundationPose cube")
 
     last_pose = None
     last_submit = 0

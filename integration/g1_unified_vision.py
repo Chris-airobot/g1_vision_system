@@ -2,10 +2,9 @@
 """Unified VIVE/root and independent dual-FoundationPose visualization.
 
 This deliberately leaves the legacy scripts unchanged. It imports their
-validated FK, frame remapping, tracker reader, viewer, and alignment averaging.
+validated FK, frame remapping, tracker reader, and viewer.
 
-Keys: I initialize alignment, X clear alignment, L reload tracker TF,
-R clear trail, H/1/2/3/+/- view, Q quit.
+Keys: L reload tracker mount TF, R clear trail, H/1/2/3/+/- view, Q quit.
 """
 
 from __future__ import annotations
@@ -30,22 +29,25 @@ sys.path.insert(0, str(VIVE_SCRIPTS))
 
 import g1_common_frame_visualizer_interactive as base  # noqa: E402
 import g1_hybrid_tracker_visualizer as hybrid  # noqa: E402
-from viva_vive_ultimate.handeye import CameraIntrinsics, CharucoEstimator  # noqa: E402
-
 from integration.foundationpose_worker import FoundationPoseWorker  # noqa: E402
 from integration.transforms import (  # noqa: E402
     BOX_DIMS_M,
     box_disagreement,
-    compose_box_poses,
+    compose_world_box_poses,
+    evaluate_camera_pose,
+    fuse_world_poses,
+    invert_transform,
     save_latest_transforms,
     tracker_root_and_camera,
-    vive_alignment_candidate,
+    validate_transform,
 )
 
 
 CAMERA_STALE_SEC = 1.0
-POSE_STALE_SEC = 2.0
 SAVE_INTERVAL_SEC = 1.0
+FP_VALID_HZ = 8.0
+FP_INVALID_HZ = 2.0
+RESEED_INTERVAL_SEC = 1.0
 BOX_EDGES = (
     (0, 1), (1, 2), (2, 3), (3, 0),
     (4, 5), (5, 6), (6, 7), (7, 4),
@@ -205,13 +207,13 @@ def box_corners() -> np.ndarray:
     ])
 
 
-def draw_box_world(viewer, image, K_T_box, label, color):
-    if K_T_box is None:
+def draw_box_world(viewer, image, E_T_box, label, color):
+    if E_T_box is None:
         return
-    points = (K_T_box[:3, :3] @ box_corners().T).T + K_T_box[:3, 3]
+    points = (E_T_box[:3, :3] @ box_corners().T).T + E_T_box[:3, 3]
     for a, b in BOX_EDGES:
         viewer.draw_line_e(image, points[a], points[b], color, 3)
-    viewer.draw_frame(image, K_T_box, label, 0.11)
+    viewer.draw_frame(image, E_T_box, label, 0.11)
 
 
 def draw_box_camera(image, camera_T_box, K, label, color):
@@ -234,6 +236,20 @@ def placeholder(text: str) -> np.ndarray:
     image = np.zeros((480, 640, 3), dtype=np.uint8)
     base.put(image, text, 20, 40, (180, 180, 180), 0.65)
     return image
+
+
+class ExternalWorldViewer(base.Interactive3DViewer):
+    """Use the legacy projection/view controls without drawing a ChArUco board."""
+
+    def draw_board(self, img, E_T_K):
+        return None
+
+    def draw_frame(self, img, T, label, length=0.15):
+        if label == "CHARUCO / FIXED WORLD K":
+            label = "FIXED WORLD / EXTERNAL D435i E"
+        elif label == "EXTERNAL D435i E":
+            return None
+        return super().draw_frame(img, T, label, length)
 
 
 def parse_args(argv=None):
@@ -261,8 +277,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--external-vive-tf",
         type=Path,
-        default=None,
-        help="Saved T_external_from_vive_world. Enables board-free runtime.",
+        default=ROOT / "vive/g1_tracker_system/calibration/T_external_from_vive_world.txt",
+        help="Saved E_T_V (T_external_from_vive_world); required at runtime.",
     )
     return parser.parse_args(argv)
 
@@ -271,12 +287,31 @@ def main(argv=None):
     args = parse_args(argv)
     fp_root = args.foundationpose_root.expanduser().resolve()
     mesh = fp_root / "box.obj"
-    T_T_B = np.eye(4) if args.no_tracker_tf else hybrid.load_T_T_B(args.tracker_tf)
+    try:
+        T_T_B = np.eye(4) if args.no_tracker_tf else hybrid.load_T_T_B(args.tracker_tf)
+    except (OSError, ValueError, RuntimeError) as exc:
+        T_T_B = None
+        print(f"G1 world path disabled: cannot load tracker mount transform: {exc}")
     if T_T_B is None:
-        print(f"Tracker transform missing: {args.tracker_tf}; alignment stays unlocked.")
+        print(f"G1 world path disabled: tracker mount transform missing: {args.tracker_tf}")
+    try:
+        E_T_V = validate_transform(
+            np.loadtxt(args.external_vive_tf, dtype=float).reshape(4, 4), "E_T_V"
+        )
+    except (OSError, ValueError) as exc:
+        E_T_V = None
+        print(f"G1 world path disabled: cannot load E_T_V: {exc}")
+
+    print("BOARD-FREE RUNTIME: fixed world is external D435i optical frame E")
+    if E_T_V is not None:
+        print("Loaded E_T_V from", args.external_vive_tf)
 
     # These are the exact readers/FK and VIVE remapping used by the hybrid runtime.
-    low = base.LowStateReader()
+    try:
+        low = base.LowStateReader()
+    except Exception as exc:
+        low = None
+        print(f"G1 world path disabled: cannot start lowstate: {exc}")
     vive = hybrid.ViveReader(args.tracker)
     g1_camera = G1CameraReader(args.g1_endpoint)
     ext_camera = ExternalCameraReader(args.external_serial)
@@ -290,48 +325,18 @@ def main(argv=None):
             args.output_dir / "foundationpose_g1",
         ),
     }
-
-    g1_intr = CameraIntrinsics(
-        width=640, height=480, camera_matrix=base.K_G1.tolist(),
-        distortion=base.D_G1.tolist(), source="g1_rgb",
-    )
-    estimator = CharucoEstimator(base.BOARD, min_corners=base.MIN_CORNERS)
-    ext_intr = None
-    last_g1_seq = last_ext_seq = -1
     last_g1_fp_seq = last_ext_fp_seq = -1
-    dg = de = None
-    K_T_V = K_T_E_fixed = E_T_K_fixed = None
-
-    # Optional board-free mode:
-    # use the fixed external D435i frame E as the world frame.
-    if args.external_vive_tf is not None:
-        E_T_V = np.loadtxt(args.external_vive_tf, dtype=float).reshape(4, 4)
-
-        # Existing code calls the world frame K. In this mode K == E.
-        K_T_V = E_T_V
-        K_T_E_fixed = np.eye(4)
-        E_T_K_fixed = np.eye(4)
-
-        print()
-        print("==============================================")
-        print("BOARD-FREE MODE")
-        print("World frame = external D435i")
-        print("Loaded T_external_from_vive_world:")
-        print(E_T_V)
-        print("ChArUco board is NOT required.")
-        print("==============================================")
-        print()
-    init_candidates, init_EK = [], []
-    init_collecting = False
-    last_init_g1_seq = -1
-    auto_ready_since = None
-    last_B = last_C = None
+    last_g1_submit = last_ext_submit = 0.0
+    ext_valid_for_rate = g1_valid_for_rate = False
+    last_ext_reseed = last_g1_reseed = -float("inf")
+    last_fused = None
+    last_fused_time = 0.0
     trajectory = []
     last_save = 0.0
 
     cv2.namedWindow("Unified Cameras", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Unified 3D World", cv2.WINDOW_NORMAL)
-    viewer = base.Interactive3DViewer(width=1100, height=760)
+    viewer = ExternalWorldViewer(width=1100, height=760)
     cv2.setMouseCallback("Unified 3D World", viewer.mouse_callback)
 
     try:
@@ -341,47 +346,32 @@ def main(argv=None):
             ext_bgr, ext_depth, K_EXT, D_EXT, ext_seq, ext_time, ext_error = ext_camera.get()
             g1_fresh = g1_rgb is not None and now - g1_time < CAMERA_STALE_SEC
             ext_fresh = ext_bgr is not None and now - ext_time < CAMERA_STALE_SEC
+            g1_bgr = (
+                cv2.cvtColor(g1_rgb, cv2.COLOR_RGB2BGR)
+                if g1_rgb is not None else placeholder("G1 CAMERA: NO INPUT")
+            )
 
-            if K_EXT is not None and ext_intr is None:
-                ext_intr = CameraIntrinsics(
-                    width=640, height=480, camera_matrix=K_EXT.tolist(),
-                    distortion=D_EXT.tolist(), source="external_d435i",
-                )
-            if g1_fresh and g1_seq != last_g1_seq:
-                last_g1_seq = g1_seq
-                try:
-                    # The server's ego_view is RGB; legacy converts it to BGR here.
-                    g1_bgr = cv2.cvtColor(g1_rgb, cv2.COLOR_RGB2BGR)
-                    dg = estimator.detect(g1_bgr, g1_intr)
-                except Exception:
-                    dg = None
-            else:
-                g1_bgr = (
-                    cv2.cvtColor(g1_rgb, cv2.COLOR_RGB2BGR)
-                    if g1_rgb is not None else placeholder("G1 CAMERA: NO INPUT")
-                )
-            if ext_fresh and ext_seq != last_ext_seq and ext_intr is not None:
-                last_ext_seq = ext_seq
-                try:
-                    de = estimator.detect(ext_bgr, ext_intr)
-                except Exception:
-                    de = None
-
-            if g1_fresh and g1_depth is not None and g1_seq != last_g1_fp_seq:
-                workers["g1"].submit(g1_rgb, g1_depth, base.K_G1)
+            g1_interval = 1.0 / (FP_VALID_HZ if g1_valid_for_rate else FP_INVALID_HZ)
+            ext_interval = 1.0 / (FP_VALID_HZ if ext_valid_for_rate else FP_INVALID_HZ)
+            if (
+                g1_fresh and g1_depth is not None and g1_seq != last_g1_fp_seq
+                and now - last_g1_submit >= g1_interval
+            ):
+                workers["g1"].submit(g1_rgb, g1_depth, base.K_G1, g1_time)
                 last_g1_fp_seq = g1_seq
-            if ext_fresh and ext_depth is not None and K_EXT is not None and ext_seq != last_ext_fp_seq:
+                last_g1_submit = now
+            if (
+                ext_fresh and ext_depth is not None and K_EXT is not None
+                and ext_seq != last_ext_fp_seq and now - last_ext_submit >= ext_interval
+            ):
                 workers["external"].submit(
-                    cv2.cvtColor(ext_bgr, cv2.COLOR_BGR2RGB), ext_depth, K_EXT
+                    cv2.cvtColor(ext_bgr, cv2.COLOR_BGR2RGB), ext_depth, K_EXT, ext_time
                 )
                 last_ext_fp_seq = ext_seq
+                last_ext_submit = now
 
-            q, mode_machine, low_time = low.get()
+            q, mode_machine, low_time = low.get() if low is not None else (None, None, 0.0)
             low_ok = q is not None and now - low_time < hybrid.LOWSTATE_STALE_SEC
-            vision_ok = (
-                low_ok and g1_fresh and dg is not None and dg.C_T_K is not None
-            )
-            ext_ok = ext_fresh and de is not None and de.C_T_K is not None
             V_T_T, vive_status, vive_hz, vive_dev, vive_time, vive_error = vive.get()
             vive_ok = (
                 V_T_T is not None and vive_status == "OK"
@@ -392,108 +382,112 @@ def main(argv=None):
             if low_ok:
                 # Preserve the legacy ROS optical convention and exact rev1.0 URDF FK.
                 B_T_C = base.pelvis_T_d435(q) @ base.D_T_C_ROS
-            K_T_B_vision = K_T_C_vision = None
-            if vision_ok:
-                K_T_C_vision = base.invT(np.asarray(dg.C_T_K, dtype=float))
-                K_T_B_vision = K_T_C_vision @ base.invT(B_T_C)
-            E_T_K_live = np.asarray(de.C_T_K, dtype=float) if ext_ok else None
-            K_T_E_live = base.invT(E_T_K_live) if ext_ok else None
 
-            # Preserve automatic alignment and the exact legacy chain:
-            # K_T_V = K_T_B @ inv(T_T_B) @ inv(V_T_T).
-            if K_T_V is None and not init_collecting and T_T_B is not None and vision_ok and vive_ok:
-                if auto_ready_since is None:
-                    auto_ready_since = now
-                elif now - auto_ready_since >= 1.0:
-                    init_candidates.clear(); init_EK.clear()
-                    last_init_g1_seq = -1
-                    init_collecting = True; auto_ready_since = None
-                    print(f"AUTO INIT: collecting {hybrid.INIT_FRAMES} frames; keep robot still")
-            elif not init_collecting:
-                auto_ready_since = None
-            if (
-                init_collecting and T_T_B is not None and vision_ok and vive_ok
-                and g1_seq != last_init_g1_seq
-            ):
-                last_init_g1_seq = g1_seq
-                init_candidates.append(
-                    vive_alignment_candidate(K_T_B_vision, T_T_B, V_T_T)
+            E_T_B = E_T_C = E_T_T = None
+            if vive_ok and E_T_V is not None and T_T_B is not None:
+                E_T_B, E_T_C, E_T_T = tracker_root_and_camera(
+                    E_T_V, V_T_T, T_T_B, B_T_C
                 )
-                if ext_ok:
-                    init_EK.append(E_T_K_live.copy())
-                if len(init_candidates) >= hybrid.INIT_FRAMES:
-                    K_T_V = hybrid.average_T(init_candidates)
-                    if init_EK:
-                        E_T_K_fixed = hybrid.average_T(init_EK)
-                        K_T_E_fixed = base.invT(E_T_K_fixed)
-                    init_candidates.clear(); init_EK.clear(); init_collecting = False
-                    trajectory.clear()
-                    print("ALIGNMENT LOCKED\nK_T_V=\n", K_T_V)
-
-            K_T_B_tracker = K_T_C_tracker = K_T_T = None
-            if K_T_V is not None and T_T_B is not None and vive_ok:
-                K_T_B_tracker, K_T_C_tracker, K_T_T = tracker_root_and_camera(
-                    K_T_V, V_T_T, T_T_B, B_T_C
-                )
-                last_B = K_T_B_tracker.copy()
-                if K_T_C_tracker is not None:
-                    last_C = K_T_C_tracker.copy()
-                position = K_T_B_tracker[:3, 3].copy()
+                position = E_T_B[:3, 3].copy()
                 if not trajectory or np.linalg.norm(position - trajectory[-1]) > 0.005:
                     trajectory.append(position); trajectory = trajectory[-300:]
 
-            if K_T_B_tracker is not None:
-                primary_B, primary_C = K_T_B_tracker, K_T_C_tracker
-            elif K_T_V is not None:
-                primary_B, primary_C = last_B, last_C
-            else:
-                primary_B, primary_C = K_T_B_vision, K_T_C_vision
-            K_T_E = K_T_E_fixed if K_T_E_fixed is not None else K_T_E_live
+            (
+                E_T_box, ext_pose_time, ext_fp_status, ext_fp_error,
+                ext_pose_depth, ext_pose_K, ext_pose_shape,
+            ) = workers["external"].get_validation_inputs()
+            (
+                C_T_box, g1_pose_time, g1_fp_status, g1_fp_error,
+                g1_pose_depth, g1_pose_K, g1_pose_shape,
+            ) = workers["g1"].get_validation_inputs()
+            ext_check = evaluate_camera_pose(
+                E_T_box, ext_pose_time, now, ext_pose_depth, ext_pose_K, ext_pose_shape
+            )
+            g1_check = evaluate_camera_pose(
+                C_T_box, g1_pose_time, now, g1_pose_depth, g1_pose_K, g1_pose_shape
+            )
+            E_T_box_ext, E_T_box_g1, composed_E_T_C = compose_world_box_poses(
+                E_T_V, V_T_T if vive_ok else None, T_T_B, B_T_C,
+                E_T_box, C_T_box,
+            )
+            # The external contribution is camera-local world E and never
+            # depends on VIVE, lowstate, FK, or G1 visibility.
+            ext_valid = ext_check.valid and E_T_box_ext is not None
+            g1_valid = g1_check.valid and E_T_box_g1 is not None
+            ext_valid_for_rate, g1_valid_for_rate = ext_valid, g1_valid
 
-            E_T_box, ext_pose_time, ext_fp_status, ext_fp_error = workers["external"].get()
-            C_T_box, g1_pose_time, g1_fp_status, g1_fp_error = workers["g1"].get()
-            if E_T_box is not None and now - ext_pose_time >= POSE_STALE_SEC:
-                E_T_box = None
-            if C_T_box is not None and now - g1_pose_time >= POSE_STALE_SEC:
-                C_T_box = None
-            K_T_box_ext, K_T_box_g1 = compose_box_poses(
-                K_T_E, E_T_box, primary_C, C_T_box
+            fusion = fuse_world_poses(
+                E_T_box_ext, ext_valid, ext_check.quality,
+                E_T_box_g1, g1_valid, g1_check.quality,
+                last_pose=last_fused, last_pose_time=last_fused_time,
+                now=now, hold_s=0.25,
             )
+            if fusion.valid and not fusion.held:
+                last_fused = fusion.pose.copy()
+                last_fused_time = now
             disagreement = (
-                box_disagreement(K_T_box_ext, K_T_box_g1)
-                if K_T_box_ext is not None and K_T_box_g1 is not None else None
+                box_disagreement(E_T_box_ext, E_T_box_g1)
+                if ext_valid and g1_valid else None
             )
+
+            # Reseed only from the other valid camera, at a bounded rate. The
+            # worker converts original-mesh pose to FoundationPose pose_last.
+            if (
+                fusion.source == "G1" and ext_fresh
+                and now - last_ext_reseed >= RESEED_INTERVAL_SEC
+            ):
+                workers["external"].request_reseed(fusion.pose)
+                last_ext_reseed = now
+            if (
+                fusion.source == "EXTERNAL" and g1_fresh and composed_E_T_C is not None
+                and now - last_g1_reseed >= RESEED_INTERVAL_SEC
+            ):
+                C_T_box_seed = invert_transform(composed_E_T_C, "E_T_C") @ fusion.pose
+                workers["g1"].request_reseed(C_T_box_seed)
+                last_g1_reseed = now
 
             world = viewer.render(
-                primary_B, primary_C, K_T_E, trajectory,
-                vive_ok if K_T_V is not None else vision_ok,
+                E_T_B, E_T_C, np.eye(4), trajectory, vive_ok,
             )
-            if K_T_T is not None:
-                viewer.draw_frame(world, K_T_T, "VIVE TRACKER T", 0.13)
-            draw_box_world(viewer, world, K_T_box_ext, "BOX [EXTERNAL]", (0, 215, 255))
-            draw_box_world(viewer, world, K_T_box_g1, "BOX [G1 CAMERA]", (255, 80, 255))
-            if disagreement is None:
-                metric_lines = ["BOX COMPARISON: waiting for both estimates"]
-            else:
-                metric_lines = [
+            if E_T_T is not None:
+                viewer.draw_frame(world, E_T_T, "VIVE TRACKER T", 0.13)
+            if ext_valid:
+                draw_box_world(viewer, world, E_T_box_ext, "BOX [EXTERNAL]", (0, 215, 255))
+            if g1_valid:
+                draw_box_world(viewer, world, E_T_box_g1, "BOX [G1 CAMERA]", (255, 80, 255))
+            if fusion.valid:
+                draw_box_world(viewer, world, fusion.pose, "BOX [FUSED]", (80, 255, 80))
+            metric_lines = [
+                f"EXT: {'VALID' if ext_valid else 'INVALID'} q={ext_check.quality:.2f} ({ext_check.reason})",
+                f"G1: {'VALID' if g1_valid else 'INVALID'} q={g1_check.quality:.2f} "
+                f"({'world chain unavailable' if g1_check.valid and not g1_valid else g1_check.reason})",
+                f"FUSED SOURCE: {fusion.source}{' (0.25 s hold)' if fusion.held else ''}",
+            ]
+            if disagreement is not None:
+                metric_lines += [
                     f"translation disagreement: {disagreement.translation_mm:.1f} mm",
-                    f"raw SO(3) disagreement: {disagreement.rotation_raw_deg:.1f} deg",
                     f"symmetry-aware disagreement: {disagreement.rotation_symmetry_deg:.1f} deg",
                 ]
             for index, text in enumerate(metric_lines):
-                base.put(world, text, 15, 650 + 25 * index, (255, 255, 255), 0.5)
+                base.put(world, text, 15, 625 + 25 * index, (255, 255, 255), 0.46)
             cv2.imshow("Unified 3D World", world)
 
             ext_vis = ext_bgr.copy() if ext_bgr is not None else placeholder("EXTERNAL D435i: NO INPUT")
             g1_vis = g1_bgr.copy()
-            draw_box_camera(ext_vis, E_T_box, K_EXT, "BOX [EXTERNAL]", (0, 215, 255))
-            draw_box_camera(g1_vis, C_T_box, base.K_G1, "BOX [G1 CAMERA]", (255, 80, 255))
+            draw_box_camera(
+                ext_vis, E_T_box, K_EXT, "BOX [EXTERNAL]",
+                (0, 215, 255) if ext_valid else (0, 0, 255),
+            )
+            draw_box_camera(
+                g1_vis, C_T_box, base.K_G1, "BOX [G1 CAMERA]",
+                (255, 80, 255) if g1_valid else (0, 0, 255),
+            )
             if ext_error:
                 base.put(ext_vis, f"CAMERA: {ext_error[:72]}", 15, 435, (0, 0, 255), 0.38)
             if g1_error:
                 base.put(g1_vis, f"CAMERA: {g1_error[:72]}", 15, 435, (0, 0, 255), 0.38)
-            base.put(ext_vis, f"FP: {ext_fp_status}", 15, 460, (0, 215, 255), 0.48)
-            base.put(g1_vis, f"FP: {g1_fp_status}", 15, 460, (255, 80, 255), 0.48)
+            base.put(ext_vis, f"EXT: {'VALID' if ext_valid else 'INVALID'} q={ext_check.quality:.2f}", 15, 460, (0, 215, 255), 0.48)
+            base.put(g1_vis, f"G1: {'VALID' if g1_valid else 'INVALID'} q={g1_check.quality:.2f}", 15, 460, (255, 80, 255), 0.48)
             if ext_fp_error:
                 base.put(ext_vis, ext_fp_error[:72], 190, 460, (0, 0, 255), 0.34)
             if g1_fp_error:
@@ -502,28 +496,19 @@ def main(argv=None):
 
             if now - last_save >= SAVE_INTERVAL_SEC:
                 save_latest_transforms(
-                    args.output_dir / "transforms", E_T_box=E_T_box, C_T_box=C_T_box,
-                    K_T_box_ext=K_T_box_ext, K_T_box_g1=K_T_box_g1,
+                    args.output_dir / "transforms",
+                    E_T_box=E_T_box if ext_valid else None,
+                    C_T_box=C_T_box if g1_valid else None,
+                    E_T_box_ext=E_T_box_ext if ext_valid else None,
+                    E_T_box_g1=E_T_box_g1 if g1_valid else None,
+                    E_T_box_fused=fusion.pose if fusion.valid else None,
                 )
                 last_save = now
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
                 break
-            if key in (ord("i"), ord("I")):
-                if T_T_B is not None and vision_ok and vive_ok:
-                    init_candidates.clear(); init_EK.clear(); last_init_g1_seq = -1
-                    init_collecting = True
-                    print(f"Collecting {hybrid.INIT_FRAMES} frames; keep robot still")
-                else:
-                    print("Cannot initialize: need tracker TF, fresh VIVE, G1 board, and lowstate")
-            elif key in (ord("x"), ord("X")):
-                K_T_V = K_T_E_fixed = E_T_K_fixed = None
-
-                init_collecting = False; init_candidates.clear(); init_EK.clear()
-                last_B = last_C = None; trajectory.clear()
-                print("Alignment cleared")
-            elif key in (ord("l"), ord("L")) and not args.no_tracker_tf:
+            if key in (ord("l"), ord("L")) and not args.no_tracker_tf:
                 try:
                     T_T_B = hybrid.load_T_T_B(args.tracker_tf)
                     print("Reloaded tracker transform:", args.tracker_tf)

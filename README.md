@@ -11,8 +11,7 @@ Unified development repo for Samsung Unitree G1 box perception/tracking.
   - G1 camera/root visualization
 
 - `foundationpose/`
-  - FoundationPose source and G1 box scripts
-  - 40 x 30 x 30 cm `box.obj`
+  - Lightweight FoundationPose reference source and G1 box scripts
   - heavy weights/data are intentionally excluded
 
 - `integration/`
@@ -20,58 +19,57 @@ Unified development repo for Samsung Unitree G1 box perception/tracking.
 
 ## Common frames
 
-- `K`: common/world frame
-- `E`: external D435i optical frame
+- `E`: fixed world frame and external D435i optical frame
+- `V`: VIVE tracking world
 - `B`: G1 pelvis/root
 - `C`: G1 onboard camera
 - `T`: VIVE tracker
 - `O`: box
 
 External camera box:
-`K_T_O_ext = K_T_E @ E_T_O`
+`E_T_O_ext = E_T_O`
 
 G1 camera box:
-`K_T_O_g1 = K_T_C @ C_T_O`
+`E_T_O_g1 = E_T_V @ V_T_T @ T_T_B @ B_T_C(q) @ C_T_O`
 
 where:
-`K_T_C = K_T_B @ B_T_C(q)`
+`E_T_C = E_T_V @ V_T_T @ T_T_B @ B_T_C(q)`
 
-The two box estimates remain independent initially and are compared in K.
+The two camera trackers remain independent and their valid estimates are fused in E.
 
 ## Unified integration runtime
 
-`integration/g1_unified_vision.py` is the first combined runtime. It retains
-the existing VIVE body-axis remap, rev1.0 URDF waist FK, 30-frame automatic
-VIVE/vision alignment, and tracker-to-root calibration. Camera acquisition and
-FoundationPose inference run outside the visualization loop, so a slow or
-missing camera/inference result does not stall the 3D UI.
+`integration/g1_unified_vision.py` loads the saved `E_T_V`, existing VIVE
+body-axis remap, calibrated `T_T_B`, and rev1.0 URDF waist FK. ChArUco is not
+used or required at runtime. Camera acquisition and FoundationPose inference
+run outside the visualization loop.
 
 The external and onboard streams each have their own `FoundationPoseWorker`.
 Each worker constructs a separate estimator, scorer, refiner, CUDA rasterizer,
-input queue, last pose, initialization dataset, and output directory. Frames
-are submitted through size-one latest-frame queues. The estimates are never
-fused or selected between. `--foundationpose-root` selects the complete
+input queue, last pose, initialization dataset, and output directory. Each
+stream has a latest-frame queue and its own submission throttle. Invalid
+streams retry at a lower rate. A worker can be periodically reseeded from the
+other camera's valid world pose, with conversion to FoundationPose's internal
+centered-mesh `pose_last`. `--foundationpose-root` selects the complete
 external FoundationPose installation used for imports, weights, compiled
 components, and `box.obj`; the repository-local `foundationpose/` tree is only
 a lightweight development/reference copy.
 
-Frame convention is `A_T_B`: map B coordinates into A. The exact chains are:
+Frame convention is `A_T_B`: map B coordinates into A. The runtime chains are:
 
 ```text
 B_T_C(q)       = pelvis_T_d435(q) @ D_T_C_ROS
-K_T_B_vision   = inv(C_T_K) @ inv(B_T_C(q))
-K_T_V          = K_T_B_vision @ inv(T_T_B) @ inv(V_T_T)  [30-frame mean]
-K_T_B          = K_T_V @ V_T_T @ T_T_B
-K_T_C          = K_T_B @ B_T_C(q)
-K_T_box_ext    = K_T_E @ E_T_box
-K_T_box_g1     = K_T_C @ C_T_box
+E_T_C          = E_T_V @ V_T_T @ T_T_B @ B_T_C(q)
+E_T_box_ext    = E_T_box
+E_T_box_g1     = E_T_C @ C_T_box
 ```
 
-The UI shows the external camera, pelvis, onboard camera, VIVE tracker, and
-both labelled boxes in K. It reports Euclidean translation separation in mm,
-raw SO(3) geodesic rotation separation in degrees, and the minimum rotation
-separation over the eight proper D4 symmetries of the 0.40 x 0.30 x 0.30 m
-cuboid. Available poses are saved under
+Pose validity combines freshness, plausible camera Z, projected cube/image
+overlap, and RGB-D depth support. When both 30 cm cube estimates are valid,
+translation is quality-weighted and rotation is averaged after resolving the
+closest of 24 proper cube symmetries. A lone valid estimate passes through;
+the last fused pose is held for at most 0.25 seconds when neither is valid.
+The UI shows all valid inputs plus the fused cube in E. Available poses are saved under
 `integration/outputs/latest/transforms/`.
 
 Hardware-free mock/static test:
@@ -91,23 +89,22 @@ G1_IFACE=enx6c1ff7bf07c7 python integration/g1_unified_vision.py \
   --foundationpose-root /home/samsung/Chris/FoundationPose \
   --tracker 0d:e1:7b:f0 \
   --tracker-tf vive/g1_tracker_system/calibration/T_tracker_from_g1_root.txt \
+  --external-vive-tf vive/g1_tracker_system/calibration/T_external_from_vive_world.txt \
   --g1-init-dir /home/samsung/Chris/FoundationPose/g1/data/live_init \
-  --external-init-dir /path/to/external_live_init
+  --external-init-dir /home/samsung/Chris/FoundationPose/g1/data/external_live_init
 ```
 
 The FoundationPose runtime root and both initialization paths are required
 runtime arguments. No weights, compiled artifacts, or RGB/depth/mask datasets
 are stored or assumed to exist in this source repository. The runtime loads
 FoundationPose from `/home/samsung/Chris/FoundationPose` and resolves the mesh
-as `/home/samsung/Chris/FoundationPose/box.obj`. The G1 initialization path
-above already exists on the `.124` machine. A separate external-camera
-initialization dataset still needs to be created, and
-`/path/to/external_live_init` must be replaced with its real location.
+as `/home/samsung/Chris/FoundationPose/box.obj`. Both synchronized camera
+initialization datasets remain outside this Git repository.
 
 Each init directory must contain its own `cam_K.txt` and
 `rgb/000000.png`, `depth/000000.png`, and `masks/000000.png`. Depth init PNGs
-use the existing FoundationPose convention of uint16 millimetres. Press `I` to
-manually restart common-world alignment, `X` to clear it, and `Q` to quit.
+use the existing FoundationPose convention of uint16 millimetres. Press `L` to
+reload the tracker mount transform, `R` to clear the trail, and `Q` to quit.
 
 ## Runtime notes
 

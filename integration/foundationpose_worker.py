@@ -12,7 +12,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from integration.transforms import validate_transform
+from integration.transforms import foundationpose_pose_last_from_original, validate_transform
 
 
 class FoundationPoseWorker:
@@ -44,14 +44,27 @@ class FoundationPoseWorker:
         self._lock = threading.Lock()
         self._pose: Optional[np.ndarray] = None
         self._pose_time = 0.0
+        self._pose_depth: Optional[np.ndarray] = None
+        self._pose_K: Optional[np.ndarray] = None
+        self._pose_image_shape: Optional[tuple[int, int]] = None
+        self._pending_reseed: Optional[np.ndarray] = None
         self._status = "STARTING"
         self._error = ""
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"fp-{name}")
         self._thread.start()
 
-    def submit(self, rgb: np.ndarray, depth_m: np.ndarray, K: np.ndarray) -> None:
-        item = (rgb.copy(), depth_m.copy(), np.asarray(K, dtype=float).copy())
+    def submit(
+        self,
+        rgb: np.ndarray,
+        depth_m: np.ndarray,
+        K: np.ndarray,
+        frame_time: Optional[float] = None,
+    ) -> None:
+        item = (
+            rgb.copy(), depth_m.copy(), np.asarray(K, dtype=float).copy(),
+            time.monotonic() if frame_time is None else float(frame_time),
+        )
         try:
             self._frames.put_nowait(item)
         except queue.Full:
@@ -72,6 +85,25 @@ class FoundationPoseWorker:
                 self._status,
                 self._error,
             )
+
+    def get_validation_inputs(self):
+        """Return a pose with the exact depth/intrinsics frame it consumed."""
+        with self._lock:
+            return (
+                None if self._pose is None else self._pose.copy(),
+                self._pose_time,
+                self._status,
+                self._error,
+                None if self._pose_depth is None else self._pose_depth.copy(),
+                None if self._pose_K is None else self._pose_K.copy(),
+                self._pose_image_shape,
+            )
+
+    def request_reseed(self, camera_T_box: np.ndarray) -> None:
+        """Queue a camera-frame original-mesh pose for thread-safe reseeding."""
+        pose = validate_transform(camera_T_box, f"{self.name}_reseed_pose").copy()
+        with self._lock:
+            self._pending_reseed = pose
 
     def stop(self) -> None:
         self._stop.set()
@@ -103,6 +135,7 @@ class FoundationPoseWorker:
                 set_seed,
                 trimesh,
             )
+            import torch  # pylint: disable=import-outside-toplevel
 
             self.output_dir.mkdir(parents=True, exist_ok=True)
             rgb_path = self.init_dir / "rgb" / "000000.png"
@@ -146,17 +179,37 @@ class FoundationPoseWorker:
 
             while not self._stop.is_set():
                 try:
-                    rgb, depth, K = self._frames.get(timeout=0.2)
+                    rgb, depth, K, frame_time = self._frames.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 try:
+                    with self._lock:
+                        reseed = self._pending_reseed
+                        self._pending_reseed = None
+                    if reseed is not None:
+                        # FoundationPose returns:
+                        #   camera_T_original = pose_last @ T_center_from_original
+                        # but track_one consumes pose_last in the centered-mesh frame.
+                        center_from_original = (
+                            estimator.get_tf_to_centered_mesh().detach().cpu().numpy()
+                        )
+                        centered_pose = foundationpose_pose_last_from_original(
+                            reseed, center_from_original
+                        )
+                        estimator.pose_last = torch.as_tensor(
+                            centered_pose, dtype=torch.float32, device="cuda"
+                        )
+                        self._set_status("RESEEDED")
                     pose = estimator.track_one(
                         rgb=rgb, depth=depth, K=K, iteration=self.track_iterations
                     )
                     pose = validate_transform(np.asarray(pose, dtype=float), f"{self.name}_T_box")
                     with self._lock:
                         self._pose = pose
-                        self._pose_time = time.monotonic()
+                        self._pose_time = frame_time
+                        self._pose_depth = depth.copy()
+                        self._pose_K = K.copy()
+                        self._pose_image_shape = tuple(rgb.shape[:2])
                         self._status = "TRACKING"
                         self._error = ""
                 except Exception as exc:  # a bad frame must not kill the worker
