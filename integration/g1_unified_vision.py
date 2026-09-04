@@ -317,6 +317,17 @@ def main(argv=None):
     vive = hybrid.ViveReader(args.tracker)
     g1_camera = G1CameraReader(args.g1_endpoint)
     ext_camera = ExternalCameraReader(args.external_serial)
+    # Pre-warm PyTorch CUDA linear algebra before the two
+    # FoundationPose worker threads start.
+    import torch
+    if torch.cuda.is_available():
+        _cuda_linalg_probe = torch.eye(
+            4, device="cuda", dtype=torch.float32
+        )
+        _ = torch.linalg.inv(_cuda_linalg_probe)
+        torch.cuda.synchronize()
+        print("CUDA linalg prewarm: OK")
+
     workers = {
         "external": FoundationPoseWorker(
             "external", fp_root, mesh, args.external_init_dir,
