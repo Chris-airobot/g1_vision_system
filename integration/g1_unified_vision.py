@@ -258,6 +258,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "integration" / "outputs" / "latest"
     )
+    parser.add_argument(
+        "--external-vive-tf",
+        type=Path,
+        default=None,
+        help="Saved T_external_from_vive_world. Enables board-free runtime.",
+    )
     return parser.parse_args(argv)
 
 
@@ -295,6 +301,26 @@ def main(argv=None):
     last_g1_fp_seq = last_ext_fp_seq = -1
     dg = de = None
     K_T_V = K_T_E_fixed = E_T_K_fixed = None
+
+    # Optional board-free mode:
+    # use the fixed external D435i frame E as the world frame.
+    if args.external_vive_tf is not None:
+        E_T_V = np.loadtxt(args.external_vive_tf, dtype=float).reshape(4, 4)
+
+        # Existing code calls the world frame K. In this mode K == E.
+        K_T_V = E_T_V
+        K_T_E_fixed = np.eye(4)
+        E_T_K_fixed = np.eye(4)
+
+        print()
+        print("==============================================")
+        print("BOARD-FREE MODE")
+        print("World frame = external D435i")
+        print("Loaded T_external_from_vive_world:")
+        print(E_T_V)
+        print("ChArUco board is NOT required.")
+        print("==============================================")
+        print()
     init_candidates, init_EK = [], []
     init_collecting = False
     last_init_g1_seq = -1
@@ -493,6 +519,7 @@ def main(argv=None):
                     print("Cannot initialize: need tracker TF, fresh VIVE, G1 board, and lowstate")
             elif key in (ord("x"), ord("X")):
                 K_T_V = K_T_E_fixed = E_T_K_fixed = None
+
                 init_collecting = False; init_candidates.clear(); init_EK.clear()
                 last_B = last_C = None; trajectory.clear()
                 print("Alignment cleared")

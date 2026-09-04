@@ -53,13 +53,13 @@ class TransformTests(unittest.TestCase):
         self.assertAlmostEqual(error.rotation_raw_deg, 90.0)
         self.assertAlmostEqual(error.rotation_symmetry_deg, 0.0, places=5)
 
-    def test_cuboid_group_has_eight_proper_unique_rotations(self):
-        self.assertEqual(len(BOX_SYMMETRIES), 8)
+    def test_cube_group_has_twenty_four_proper_unique_rotations(self):
+        self.assertEqual(len(BOX_SYMMETRIES), 24)
         for rotation in BOX_SYMMETRIES:
             np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-12)
             self.assertAlmostEqual(np.linalg.det(rotation), 1.0)
         rounded = {tuple(np.round(rotation, 10).flat) for rotation in BOX_SYMMETRIES}
-        self.assertEqual(len(rounded), 8)
+        self.assertEqual(len(rounded), 24)
 
     def test_vive_alignment_and_runtime_chain_are_inverse(self):
         K_T_B_vision = T(t=(1.0, 2.0, 3.0))

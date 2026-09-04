@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 
 
-BOX_DIMS_M = np.array([0.40, 0.30, 0.30], dtype=float)
+BOX_DIMS_M = np.array([0.30, 0.30, 0.30], dtype=float)
 
 
 def validate_transform(T: np.ndarray, name: str = "transform") -> np.ndarray:
@@ -92,24 +92,43 @@ def rotation_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cosine)))
 
 
-def _rx(degrees: float) -> np.ndarray:
-    a = math.radians(degrees)
-    c, s = math.cos(a), math.sin(a)
-    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
+def _cube_symmetries() -> tuple[np.ndarray, ...]:
+    """The 24 proper rotational symmetries of a cube."""
+    import itertools
+
+    rotations = []
+
+    def add(R):
+        R = np.asarray(R, dtype=float)
+        if np.linalg.det(R) < 0.5:
+            return
+        if not any(np.allclose(R, old) for old in rotations):
+            rotations.append(R)
+
+    # Keep identity and +90 deg about Z first for deterministic tests.
+    add(np.eye(3))
+    add(np.array([
+        [0.0, -1.0, 0.0],
+        [1.0,  0.0, 0.0],
+        [0.0,  0.0, 1.0],
+    ]))
+
+    I = np.eye(3)
+    for perm in itertools.permutations(range(3)):
+        P = I[:, perm]
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            R = P @ np.diag(signs)
+            add(R)
+
+    if len(rotations) != 24:
+        raise RuntimeError(
+            f"Expected 24 cube rotations, got {len(rotations)}"
+        )
+
+    return tuple(rotations)
 
 
-def _rot180_about_yz_axis(degrees: float) -> np.ndarray:
-    a = math.radians(degrees)
-    axis = np.array([0.0, math.cos(a), math.sin(a)], dtype=float)
-    return 2.0 * np.outer(axis, axis) - np.eye(3)
-
-
-# Reused from foundationpose/g1/scripts/compare_offline_fp_apriltag.py.
-# These are the 8 proper rotations (D4) of a 0.40 x 0.30 x 0.30 m cuboid.
-BOX_SYMMETRIES = tuple(
-    [_rx(a) for a in (0, 90, 180, 270)]
-    + [_rot180_about_yz_axis(a) for a in (0, 45, 90, 135)]
-)
+BOX_SYMMETRIES = _cube_symmetries()
 
 
 @dataclass(frozen=True)

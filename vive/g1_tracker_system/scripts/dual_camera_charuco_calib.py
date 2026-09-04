@@ -480,9 +480,9 @@ def main():
     # External D435i
     # --------------------------------------------------------
     pipe = rs.pipeline()
-    cfg = rs.config()
+    rs_cfg = rs.config()
 
-    cfg.enable_stream(
+    rs_cfg.enable_stream(
         rs.stream.color,
         640,
         480,
@@ -490,7 +490,7 @@ def main():
         30
     )
 
-    profile = pipe.start(cfg)
+    profile = pipe.start(rs_cfg)
 
     color_profile = (
         profile
