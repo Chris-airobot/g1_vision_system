@@ -32,6 +32,7 @@ import g1_hybrid_tracker_visualizer as hybrid  # noqa: E402
 from integration.foundationpose_worker import FoundationPoseWorker  # noqa: E402
 from integration.transforms import (  # noqa: E402
     BOX_DIMS_M,
+    LOST,
     box_disagreement,
     compose_world_box_poses,
     evaluate_camera_pose,
@@ -48,6 +49,7 @@ SAVE_INTERVAL_SEC = 1.0
 FP_VALID_HZ = 8.0
 FP_INVALID_HZ = 2.0
 RESEED_INTERVAL_SEC = 1.0
+VALIDATION_HZ = 20.0
 BOX_EDGES = (
     (0, 1), (1, 2), (2, 3), (3, 0),
     (4, 5), (5, 6), (6, 7), (7, 4),
@@ -329,10 +331,19 @@ def main(argv=None):
     last_g1_submit = last_ext_submit = 0.0
     ext_valid_for_rate = g1_valid_for_rate = False
     last_ext_reseed = last_g1_reseed = -float("inf")
-    last_fused = None
-    last_fused_time = 0.0
     trajectory = []
     last_save = 0.0
+    last_save_signature = None
+    last_validation = -float("inf")
+    E_T_box = C_T_box = None
+    ext_pose_time = g1_pose_time = 0.0
+    ext_fp_status = g1_fp_status = "STARTING"
+    ext_fp_error = g1_fp_error = ""
+    ext_pose_depth = g1_pose_depth = None
+    ext_pose_K = g1_pose_K = None
+    ext_pose_shape = g1_pose_shape = None
+    ext_check = evaluate_camera_pose(None, 0.0, 0.0, None, None, None)
+    g1_check = evaluate_camera_pose(None, 0.0, 0.0, None, None, None)
 
     cv2.namedWindow("Unified Cameras", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Unified 3D World", cv2.WINDOW_NORMAL)
@@ -392,20 +403,26 @@ def main(argv=None):
                 if not trajectory or np.linalg.norm(position - trajectory[-1]) > 0.005:
                     trajectory.append(position); trajectory = trajectory[-300:]
 
-            (
-                E_T_box, ext_pose_time, ext_fp_status, ext_fp_error,
-                ext_pose_depth, ext_pose_K, ext_pose_shape,
-            ) = workers["external"].get_validation_inputs()
-            (
-                C_T_box, g1_pose_time, g1_fp_status, g1_fp_error,
-                g1_pose_depth, g1_pose_K, g1_pose_shape,
-            ) = workers["g1"].get_validation_inputs()
-            ext_check = evaluate_camera_pose(
-                E_T_box, ext_pose_time, now, ext_pose_depth, ext_pose_K, ext_pose_shape
-            )
-            g1_check = evaluate_camera_pose(
-                C_T_box, g1_pose_time, now, g1_pose_depth, g1_pose_K, g1_pose_shape
-            )
+            # Evaluate the pose with the exact depth/K frame consumed by that
+            # worker. Cap the CPU ray-cast rate so rendering remains responsive.
+            if now - last_validation >= 1.0 / VALIDATION_HZ:
+                (
+                    E_T_box, ext_pose_time, ext_fp_status, ext_fp_error,
+                    ext_pose_depth, ext_pose_K, ext_pose_shape,
+                ) = workers["external"].get_validation_inputs()
+                (
+                    C_T_box, g1_pose_time, g1_fp_status, g1_fp_error,
+                    g1_pose_depth, g1_pose_K, g1_pose_shape,
+                ) = workers["g1"].get_validation_inputs()
+                ext_check = evaluate_camera_pose(
+                    E_T_box, ext_pose_time, now,
+                    ext_pose_depth, ext_pose_K, ext_pose_shape,
+                )
+                g1_check = evaluate_camera_pose(
+                    C_T_box, g1_pose_time, now,
+                    g1_pose_depth, g1_pose_K, g1_pose_shape,
+                )
+                last_validation = now
             E_T_box_ext, E_T_box_g1, composed_E_T_C = compose_world_box_poses(
                 E_T_V, V_T_T if vive_ok else None, T_T_B, B_T_C,
                 E_T_box, C_T_box,
@@ -414,17 +431,14 @@ def main(argv=None):
             # depends on VIVE, lowstate, FK, or G1 visibility.
             ext_valid = ext_check.valid and E_T_box_ext is not None
             g1_valid = g1_check.valid and E_T_box_g1 is not None
+            ext_state = ext_check.state if ext_valid else LOST
+            g1_state = g1_check.state if g1_valid else LOST
             ext_valid_for_rate, g1_valid_for_rate = ext_valid, g1_valid
 
             fusion = fuse_world_poses(
                 E_T_box_ext, ext_valid, ext_check.quality,
                 E_T_box_g1, g1_valid, g1_check.quality,
-                last_pose=last_fused, last_pose_time=last_fused_time,
-                now=now, hold_s=0.25,
             )
-            if fusion.valid and not fusion.held:
-                last_fused = fusion.pose.copy()
-                last_fused_time = now
             disagreement = (
                 box_disagreement(E_T_box_ext, E_T_box_g1)
                 if ext_valid and g1_valid else None
@@ -458,10 +472,11 @@ def main(argv=None):
             if fusion.valid:
                 draw_box_world(viewer, world, fusion.pose, "BOX [FUSED]", (80, 255, 80))
             metric_lines = [
-                f"EXT: {'VALID' if ext_valid else 'INVALID'} q={ext_check.quality:.2f} ({ext_check.reason})",
-                f"G1: {'VALID' if g1_valid else 'INVALID'} q={g1_check.quality:.2f} "
+                f"EXT: {ext_state} q={ext_check.quality:.2f} ({ext_check.reason})",
+                f"G1: {g1_state} q={g1_check.quality:.2f} "
                 f"({'world chain unavailable' if g1_check.valid and not g1_valid else g1_check.reason})",
-                f"FUSED SOURCE: {fusion.source}{' (0.25 s hold)' if fusion.held else ''}",
+                f"FUSED SOURCE: {fusion.source}",
+                f"BOX: {'TRACKED' if fusion.valid else 'LOST'}",
             ]
             if disagreement is not None:
                 metric_lines += [
@@ -474,27 +489,31 @@ def main(argv=None):
 
             ext_vis = ext_bgr.copy() if ext_bgr is not None else placeholder("EXTERNAL D435i: NO INPUT")
             g1_vis = g1_bgr.copy()
-            draw_box_camera(
-                ext_vis, E_T_box, K_EXT, "BOX [EXTERNAL]",
-                (0, 215, 255) if ext_valid else (0, 0, 255),
-            )
-            draw_box_camera(
-                g1_vis, C_T_box, base.K_G1, "BOX [G1 CAMERA]",
-                (255, 80, 255) if g1_valid else (0, 0, 255),
-            )
+            if ext_valid:
+                draw_box_camera(
+                    ext_vis, E_T_box, K_EXT, "BOX [EXTERNAL]", (0, 215, 255)
+                )
+            if g1_valid:
+                draw_box_camera(
+                    g1_vis, C_T_box, base.K_G1, "BOX [G1 CAMERA]", (255, 80, 255)
+                )
             if ext_error:
                 base.put(ext_vis, f"CAMERA: {ext_error[:72]}", 15, 435, (0, 0, 255), 0.38)
             if g1_error:
                 base.put(g1_vis, f"CAMERA: {g1_error[:72]}", 15, 435, (0, 0, 255), 0.38)
-            base.put(ext_vis, f"EXT: {'VALID' if ext_valid else 'INVALID'} q={ext_check.quality:.2f}", 15, 460, (0, 215, 255), 0.48)
-            base.put(g1_vis, f"G1: {'VALID' if g1_valid else 'INVALID'} q={g1_check.quality:.2f}", 15, 460, (255, 80, 255), 0.48)
+            base.put(ext_vis, f"EXT: {ext_state} q={ext_check.quality:.2f}", 15, 460, (0, 215, 255), 0.48)
+            base.put(g1_vis, f"G1: {g1_state} q={g1_check.quality:.2f}", 15, 460, (255, 80, 255), 0.48)
             if ext_fp_error:
                 base.put(ext_vis, ext_fp_error[:72], 190, 460, (0, 0, 255), 0.34)
             if g1_fp_error:
                 base.put(g1_vis, g1_fp_error[:72], 190, 460, (0, 0, 255), 0.34)
             cv2.imshow("Unified Cameras", np.hstack((ext_vis, g1_vis)))
 
-            if now - last_save >= SAVE_INTERVAL_SEC:
+            save_signature = (ext_valid, g1_valid, fusion.valid, fusion.source)
+            if (
+                now - last_save >= SAVE_INTERVAL_SEC
+                or save_signature != last_save_signature
+            ):
                 save_latest_transforms(
                     args.output_dir / "transforms",
                     E_T_box=E_T_box if ext_valid else None,
@@ -504,6 +523,7 @@ def main(argv=None):
                     E_T_box_fused=fusion.pose if fusion.valid else None,
                 )
                 last_save = now
+                last_save_signature = save_signature
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):

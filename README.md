@@ -64,13 +64,20 @@ E_T_box_ext    = E_T_box
 E_T_box_g1     = E_T_C @ C_T_box
 ```
 
-Pose validity combines freshness, plausible camera Z, projected cube/image
-overlap, and RGB-D depth support. When both 30 cm cube estimates are valid,
-translation is quality-weighted and rotation is averaged after resolving the
-closest of 24 proper cube symmetries. A lone valid estimate passes through;
-the last fused pose is held for at most 0.25 seconds when neither is valid.
-The UI shows all valid inputs plus the fused cube in E. Available poses are saved under
-`integration/outputs/latest/transforms/`.
+Pose visibility is classified as `TRACKING`, `PARTIAL`, or `LOST`. For the
+exact RGB-D frame associated with each FoundationPose result, the validator
+ray-casts the nearest expected 30 cm cube surface and compares observed depth
+pixel-by-pixel using a 25 mm or 1.5% depth tolerance, whichever is larger.
+Image overlap, depth coverage, agreeing surface pixels, closer occluding
+geometry, and farther/background geometry contribute to the classification
+and quality. `TRACKING` and `PARTIAL` participate in fusion; `LOST` never does.
+
+When both estimates are usable, translation is quality-weighted and rotation
+is averaged after resolving the closest of 24 proper cube symmetries. A lone
+usable estimate passes through. If both cameras are `LOST`, the current fused
+pose immediately becomes invalid: source is `NONE`, the fused wireframe is not
+drawn, and saved current-pose files are removed. Available current poses are
+saved under `integration/outputs/latest/transforms/`.
 
 Hardware-free mock/static test:
 
@@ -91,7 +98,7 @@ G1_IFACE=enx6c1ff7bf07c7 python integration/g1_unified_vision.py \
   --tracker-tf vive/g1_tracker_system/calibration/T_tracker_from_g1_root.txt \
   --external-vive-tf vive/g1_tracker_system/calibration/T_external_from_vive_world.txt \
   --g1-init-dir /home/samsung/Chris/FoundationPose/g1/data/live_init \
-  --external-init-dir /home/samsung/Chris/FoundationPose/g1/data/external_live_init
+  --external-init-dir /path/to/external_live_init
 ```
 
 The FoundationPose runtime root and both initialization paths are required

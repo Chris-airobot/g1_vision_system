@@ -6,11 +6,15 @@ import numpy as np
 
 from integration.transforms import (
     BOX_SYMMETRIES,
+    LOST,
+    PARTIAL,
+    TRACKING,
     box_disagreement,
     compose_world_box_poses,
     evaluate_camera_pose,
     foundationpose_pose_last_from_original,
     fuse_world_poses,
+    render_expected_cube_depth,
     save_latest_transforms,
     tracker_root_and_camera,
     vive_alignment_candidate,
@@ -49,13 +53,13 @@ class TransformTests(unittest.TestCase):
         np.testing.assert_allclose(E_T_C, E_T_V @ V_T_T @ T_T_B @ B_T_C)
         np.testing.assert_allclose(g1, E_T_C @ C_T_box)
 
-    def test_external_only_fusion(self):
+    def test_g1_lost_external_tracking_uses_external_only(self):
         ext = T(t=(1, 2, 3))
         result = fuse_world_poses(ext, True, 0.8, None, False, 0.0)
         self.assertEqual(result.source, "EXTERNAL")
         np.testing.assert_allclose(result.pose, ext)
 
-    def test_g1_only_fusion(self):
+    def test_external_lost_g1_tracking_uses_g1_only(self):
         g1 = T(t=(1, 2, 3))
         result = fuse_world_poses(None, False, 0.0, g1, True, 0.7)
         self.assertEqual(result.source, "G1")
@@ -68,21 +72,11 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(result.source, "BOTH")
         np.testing.assert_allclose(result.pose[:3, 3], [0.075, 0, 1])
 
-    def test_neither_holds_for_only_025_seconds(self):
-        last = T(t=(1, 2, 3))
-        held = fuse_world_poses(
-            None, False, 0, None, False, 0,
-            last_pose=last, last_pose_time=10.0, now=10.25,
-        )
-        self.assertTrue(held.valid)
-        self.assertTrue(held.held)
-        self.assertEqual(held.source, "NONE")
-        expired = fuse_world_poses(
-            None, False, 0, None, False, 0,
-            last_pose=last, last_pose_time=10.0, now=10.251,
-        )
-        self.assertFalse(expired.valid)
-        self.assertIsNone(expired.pose)
+    def test_both_lost_has_no_current_or_held_output(self):
+        result = fuse_world_poses(None, False, 0, None, False, 0)
+        self.assertFalse(result.valid)
+        self.assertEqual(result.source, "NONE")
+        self.assertIsNone(result.pose)
 
     def test_raw_and_cube_symmetry_errors(self):
         a = T()
@@ -122,30 +116,92 @@ class TransformTests(unittest.TestCase):
         result = fuse_world_poses(T(), True, 0.5, T(rotation), True, 0.5)
         np.testing.assert_allclose(result.pose[:3, :3], expected, atol=1e-7)
 
-    def test_pose_validity_and_stale_rejection(self):
+    @staticmethod
+    def _camera_test_data(pose):
         K = np.array([[300.0, 0, 320.0], [0, 300.0, 240.0], [0, 0, 1.0]])
+        rendered = render_expected_cube_depth(pose, K, (480, 640))
+        depth = np.zeros((480, 640), dtype=float)
+        surface = np.isfinite(rendered.depth_m)
+        depth[surface] = rendered.depth_m[surface]
+        return K, depth, surface
+
+    def test_fully_visible_cube_is_tracking(self):
         pose = T(t=(0, 0, 1.0))
+        K, depth, _ = self._camera_test_data(pose)
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, TRACKING, result.reason)
+        self.assertGreater(result.surface_agreement, 0.99)
+        self.assertGreater(result.quality, 0.5)
+
+    def test_partially_outside_image_is_partial_with_support(self):
+        pose = T(t=(1.0, 0, 1.0))
+        K, depth, _ = self._camera_test_data(pose)
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, PARTIAL, result.reason)
+        self.assertGreater(result.image_overlap, 0.20)
+        self.assertLess(result.image_overlap, 0.70)
+
+    def test_partially_occluded_cube_is_partial(self):
+        pose = T(t=(0, 0, 1.0))
+        K, depth, surface = self._camera_test_data(pose)
+        ys, xs = np.where(surface)
+        occluded = xs < np.median(xs)
+        depth[ys[occluded], xs[occluded]] -= 0.10
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, PARTIAL, result.reason)
+        self.assertGreater(result.occlusion_ratio, 0.45)
+        self.assertGreater(result.surface_agreement, 0.45)
+
+    def test_completely_occluded_cube_is_lost(self):
+        pose = T(t=(0, 0, 1.0))
+        K, depth, surface = self._camera_test_data(pose)
+        depth[surface] -= 0.10
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertGreater(result.occlusion_ratio, 0.99)
+        self.assertEqual(result.surface_agreement, 0.0)
+
+    def test_completely_outside_image_is_lost(self):
+        pose = T(t=(5, 0, 1.0))
+        K = np.array([[300.0, 0, 320.0], [0, 300.0, 240.0], [0, 0, 1.0]])
         depth = np.ones((480, 640), dtype=float)
-        valid = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, (480, 640))
-        self.assertTrue(valid.valid, valid.reason)
-        self.assertGreater(valid.quality, 0.5)
-        older = evaluate_camera_pose(pose, 9.5, 10.0, depth, K, (480, 640))
-        self.assertTrue(older.valid, older.reason)
-        self.assertLess(older.quality, valid.quality)
-        stale = evaluate_camera_pose(pose, 9.0, 10.0, depth, K, (480, 640))
-        self.assertFalse(stale.valid)
-        self.assertEqual(stale.reason, "stale")
-        inconsistent = evaluate_camera_pose(
-            pose, 9.9, 10.0, np.full((480, 640), 3.0), K, (480, 640)
-        )
-        self.assertFalse(inconsistent.valid)
-        self.assertEqual(inconsistent.reason, "depth mismatch")
-        behind = evaluate_camera_pose(T(t=(0, 0, -1)), 9.9, 10.0, depth, K, (480, 640))
-        self.assertFalse(behind.valid)
-        self.assertEqual(behind.reason, "implausible Z")
-        offscreen = evaluate_camera_pose(T(t=(5, 0, 1)), 9.9, 10.0, depth, K, (480, 640))
-        self.assertFalse(offscreen.valid)
-        self.assertEqual(offscreen.reason, "outside image")
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertEqual(result.reason, "outside image")
+
+    def test_unrelated_background_depth_is_lost(self):
+        pose = T(t=(0, 0, 1.0))
+        K, depth, surface = self._camera_test_data(pose)
+        depth[surface] = 3.0
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertEqual(result.reason, "surface depth mismatch")
+        self.assertGreater(result.behind_ratio, 0.99)
+
+    def test_no_depth_support_is_lost(self):
+        pose = T(t=(0, 0, 1.0))
+        K, depth, _ = self._camera_test_data(pose)
+        depth[:] = 0.0
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertEqual(result.reason, "insufficient depth")
+        self.assertGreater(result.missing_depth_ratio, 0.99)
+
+    def test_stale_pose_is_lost_even_with_surface_support(self):
+        pose = T(t=(0, 0, 1.0))
+        K, depth, _ = self._camera_test_data(pose)
+        result = evaluate_camera_pose(pose, 9.0, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertEqual(result.reason, "stale")
+        self.assertEqual(result.quality, 0.0)
+
+    def test_implausible_camera_z_is_lost(self):
+        pose = T(t=(0, 0, -1.0))
+        K = np.array([[300.0, 0, 320.0], [0, 300.0, 240.0], [0, 0, 1.0]])
+        depth = np.ones((480, 640), dtype=float)
+        result = evaluate_camera_pose(pose, 9.9, 10.0, depth, K, depth.shape)
+        self.assertEqual(result.state, LOST)
+        self.assertEqual(result.reason, "implausible Z")
 
     def test_foundationpose_reseed_uses_centered_pose_last_convention(self):
         camera_T_original = T(t=(0.1, -0.2, 1.3))

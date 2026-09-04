@@ -16,6 +16,27 @@ import numpy as np
 
 BOX_DIMS_M = np.array([0.30, 0.30, 0.30], dtype=float)
 
+# RGB-D visibility thresholds. Surface agreement uses a narrow metric tolerance,
+# never the cube's 0.30 m front-to-back extent.
+SURFACE_ABS_TOLERANCE_M = 0.025
+SURFACE_REL_TOLERANCE = 0.015
+TRACKING_MIN_OVERLAP = 0.70
+TRACKING_MIN_VISIBLE_PIXELS = 500
+TRACKING_MIN_DEPTH_COVERAGE = 0.70
+TRACKING_MIN_SURFACE_AGREEMENT = 0.60
+TRACKING_MIN_AGREEMENT_OF_DEPTH = 0.70
+TRACKING_MAX_OCCLUSION = 0.25
+TRACKING_MAX_BEHIND = 0.25
+PARTIAL_MIN_OVERLAP = 0.20
+PARTIAL_MIN_VISIBLE_PIXELS = 150
+PARTIAL_MIN_DEPTH_COVERAGE = 0.25
+PARTIAL_MIN_SURFACE_AGREEMENT = 0.20
+PARTIAL_MIN_AGREEMENT_OF_DEPTH = 0.45
+
+TRACKING = "TRACKING"
+PARTIAL = "PARTIAL"
+LOST = "LOST"
+
 
 def validate_transform(T: np.ndarray, name: str = "transform") -> np.ndarray:
     T = np.asarray(T, dtype=float)
@@ -191,41 +212,145 @@ def _polygon_area(polygon: np.ndarray) -> float:
     ) * 0.5)
 
 
-def _polygon_mask(polygon: np.ndarray, height: int, width: int) -> np.ndarray:
-    mask = np.zeros((height, width), dtype=bool)
-    if len(polygon) < 3:
-        return mask
-    x0 = max(0, int(np.floor(polygon[:, 0].min())))
-    x1 = min(width - 1, int(np.ceil(polygon[:, 0].max())))
-    y0 = max(0, int(np.floor(polygon[:, 1].min())))
-    y1 = min(height - 1, int(np.ceil(polygon[:, 1].max())))
+@dataclass(frozen=True)
+class CubeSurfaceRender:
+    depth_m: np.ndarray
+    projected_area_px: float
+    visible_pixels: int
+    image_overlap: float
+
+
+def render_expected_cube_depth(
+    camera_T_box: np.ndarray,
+    K: np.ndarray,
+    image_shape: tuple[int, int],
+) -> CubeSurfaceRender:
+    """Ray-cast the nearest 30 cm cube surface into a camera depth image.
+
+    Camera rays use ``[x/z, y/z, 1]``, so the ray parameter is directly the
+    expected camera-frame Z depth. This is an analytic z-buffer for the cube.
+    Pixels outside the rendered surface are NaN.
+    """
+    pose = validate_transform(camera_T_box, "camera_T_box")
+    K = np.asarray(K, dtype=float)
+    height, width = int(image_shape[0]), int(image_shape[1])
+    expected = np.full((height, width), np.nan, dtype=np.float32)
+    if (
+        K.shape != (3, 3) or not np.all(np.isfinite(K))
+        or K[0, 0] <= 0.0 or K[1, 1] <= 0.0
+        or height <= 0 or width <= 0
+    ):
+        return CubeSurfaceRender(expected, 0.0, 0, 0.0)
+
+    corners_camera = (pose[:3, :3] @ cube_corners().T).T + pose[:3, 3]
+    if np.any(corners_camera[:, 2] <= 0.03):
+        return CubeSurfaceRender(expected, 0.0, 0, 0.0)
+    uv = np.column_stack((
+        K[0, 0] * corners_camera[:, 0] / corners_camera[:, 2] + K[0, 2],
+        K[1, 1] * corners_camera[:, 1] / corners_camera[:, 2] + K[1, 2],
+    ))
+    hull = _convex_hull(uv)
+    projected_area = _polygon_area(hull)
+    if projected_area <= 0.0:
+        return CubeSurfaceRender(expected, projected_area, 0, 0.0)
+
+    x0 = max(0, int(np.floor(uv[:, 0].min())))
+    x1 = min(width - 1, int(np.ceil(uv[:, 0].max())))
+    y0 = max(0, int(np.floor(uv[:, 1].min())))
+    y1 = min(height - 1, int(np.ceil(uv[:, 1].max())))
     if x1 < x0 or y1 < y0:
-        return mask
+        return CubeSurfaceRender(expected, projected_area, 0, 0.0)
+
     xs, ys = np.meshgrid(
         np.arange(x0, x1 + 1, dtype=float) + 0.5,
         np.arange(y0, y1 + 1, dtype=float) + 0.5,
     )
-    inside_positive = np.ones(xs.shape, dtype=bool)
-    inside_negative = np.ones(xs.shape, dtype=bool)
-    for a, b in zip(polygon, np.roll(polygon, -1, axis=0)):
-        cross = (b[0] - a[0]) * (ys - a[1]) - (b[1] - a[1]) * (xs - a[0])
-        inside_positive &= cross >= -1e-8
-        inside_negative &= cross <= 1e-8
-    mask[y0:y1 + 1, x0:x1 + 1] = inside_positive | inside_negative
-    return mask
+    rays_camera = np.column_stack((
+        ((xs - K[0, 2]) / K[0, 0]).ravel(),
+        ((ys - K[1, 2]) / K[1, 1]).ravel(),
+        np.ones(xs.size, dtype=float),
+    ))
+    # camera_T_box maps box to camera. Transform camera origin and ray
+    # directions into the box frame, then use a vectorized slab intersection.
+    origin_box = -pose[:3, :3].T @ pose[:3, 3]
+    directions_box = rays_camera @ pose[:3, :3]
+    half = BOX_DIMS_M * 0.5
+    near = np.full(xs.size, -np.inf, dtype=float)
+    far = np.full(xs.size, np.inf, dtype=float)
+    possible = np.ones(xs.size, dtype=bool)
+    for axis in range(3):
+        direction = directions_box[:, axis]
+        parallel = np.abs(direction) < 1e-12
+        possible &= ~parallel | (
+            (origin_box[axis] >= -half[axis])
+            & (origin_box[axis] <= half[axis])
+        )
+        nonparallel = ~parallel
+        first = np.full(xs.size, -np.inf, dtype=float)
+        second = np.full(xs.size, np.inf, dtype=float)
+        first[nonparallel] = (
+            -half[axis] - origin_box[axis]
+        ) / direction[nonparallel]
+        second[nonparallel] = (
+            half[axis] - origin_box[axis]
+        ) / direction[nonparallel]
+        near = np.maximum(near, np.minimum(first, second))
+        far = np.minimum(far, np.maximum(first, second))
+    hit = possible & (near > 0.0) & (far >= near)
+    patch = expected[y0:y1 + 1, x0:x1 + 1]
+    patch_flat = patch.ravel()
+    patch_flat[hit] = near[hit].astype(np.float32)
+    expected[y0:y1 + 1, x0:x1 + 1] = patch_flat.reshape(patch.shape)
+    visible_pixels = int(hit.sum())
+    overlap = float(np.clip(visible_pixels / max(projected_area, 1.0), 0.0, 1.0))
+    return CubeSurfaceRender(expected, projected_area, visible_pixels, overlap)
 
 
 @dataclass(frozen=True)
 class PoseValidity:
-    valid: bool
+    state: str
     quality: float
     age_s: float
     center_z_m: float
     image_overlap: float
     projected_area_px: float
+    projected_visible_area_px: float
     depth_coverage: float
-    depth_consistency: float
+    surface_agreement: float
+    agreement_of_valid_depth: float
+    missing_depth_ratio: float
+    occlusion_ratio: float
+    behind_ratio: float
+    supported_pixels: int
     reason: str
+
+    @property
+    def valid(self) -> bool:
+        return self.state != LOST
+
+
+def _invalid_pose_validity(
+    reason: str,
+    *,
+    age_s: float = float("inf"),
+    center_z_m: float = 0.0,
+    image_overlap: float = 0.0,
+    projected_area_px: float = 0.0,
+    projected_visible_area_px: float = 0.0,
+    depth_coverage: float = 0.0,
+    surface_agreement: float = 0.0,
+    agreement_of_valid_depth: float = 0.0,
+    missing_depth_ratio: float = 1.0,
+    occlusion_ratio: float = 0.0,
+    behind_ratio: float = 0.0,
+    supported_pixels: int = 0,
+) -> PoseValidity:
+    return PoseValidity(
+        LOST, 0.0, age_s, center_z_m, image_overlap, projected_area_px,
+        projected_visible_area_px, depth_coverage, surface_agreement,
+        agreement_of_valid_depth, missing_depth_ratio, occlusion_ratio,
+        behind_ratio, supported_pixels, reason,
+    )
 
 
 def evaluate_camera_pose(
@@ -238,69 +363,120 @@ def evaluate_camera_pose(
     *,
     max_age_s: float = 0.75,
 ) -> PoseValidity:
-    """Evaluate freshness, projection, and RGB-D support for a cube pose."""
-    invalid = PoseValidity(False, 0.0, float("inf"), 0.0, 0.0, 0.0, 0.0, 0.0, "missing")
+    """Classify a pose from freshness and rendered-surface RGB-D support."""
+    invalid = _invalid_pose_validity("missing")
     if camera_T_box is None or depth_m is None or K is None or image_shape is None:
         return invalid
     try:
         pose = validate_transform(camera_T_box, "camera_T_box")
     except ValueError as exc:
-        return PoseValidity(False, 0.0, float("inf"), 0.0, 0.0, 0.0, 0.0, 0.0, str(exc))
+        return _invalid_pose_validity(str(exc))
     age = max(0.0, float(now) - float(pose_time))
     height, width = (int(image_shape[0]), int(image_shape[1]))
     depth = np.asarray(depth_m, dtype=float)
     K = np.asarray(K, dtype=float)
-    if K.shape != (3, 3) or not np.all(np.isfinite(K)) or height <= 0 or width <= 0:
-        return PoseValidity(False, 0.0, age, float(pose[2, 3]), 0.0, 0.0, 0.0, 0.0, "invalid intrinsics")
+    if (
+        K.shape != (3, 3) or not np.all(np.isfinite(K))
+        or K[0, 0] <= 0.0 or K[1, 1] <= 0.0
+        or height <= 0 or width <= 0
+    ):
+        return _invalid_pose_validity(
+            "invalid intrinsics", age_s=age, center_z_m=float(pose[2, 3])
+        )
     if depth.shape != (height, width):
-        return PoseValidity(False, 0.0, age, float(pose[2, 3]), 0.0, 0.0, 0.0, 0.0, "depth shape")
+        return _invalid_pose_validity(
+            "depth shape", age_s=age, center_z_m=float(pose[2, 3])
+        )
 
     points = (pose[:3, :3] @ cube_corners().T).T + pose[:3, 3]
     z = points[:, 2]
     center_z = float(pose[2, 3])
     z_plausible = 0.15 <= center_z <= 5.0 and float(z.min()) > 0.03
     if not z_plausible:
-        return PoseValidity(False, 0.0, age, center_z, 0.0, 0.0, 0.0, 0.0, "implausible Z")
+        return _invalid_pose_validity("implausible Z", age_s=age, center_z_m=center_z)
 
-    uv = np.column_stack((
-        K[0, 0] * points[:, 0] / z + K[0, 2],
-        K[1, 1] * points[:, 1] / z + K[1, 2],
-    ))
-    hull = _convex_hull(uv)
-    projected_area = _polygon_area(hull)
-    region = _polygon_mask(hull, height, width)
-    visible_pixels = int(region.sum())
-    overlap = float(min(1.0, visible_pixels / max(projected_area, 1.0)))
+    rendered = render_expected_cube_depth(pose, K, (height, width))
+    surface = np.isfinite(rendered.depth_m)
+    visible_pixels = rendered.visible_pixels
+    if visible_pixels == 0:
+        return _invalid_pose_validity(
+            "outside image", age_s=age, center_z_m=center_z,
+            projected_area_px=rendered.projected_area_px,
+        )
 
-    region_depth = depth[region]
-    usable = np.isfinite(region_depth) & (region_depth > 0.05) & (region_depth < 10.0)
-    coverage = float(usable.mean()) if len(region_depth) else 0.0
-    margin = 0.06
-    consistent = usable & (region_depth >= float(z.min()) - margin) & (
-        region_depth <= float(z.max()) + margin
+    observed = depth[surface]
+    expected = rendered.depth_m[surface].astype(float)
+    usable = np.isfinite(observed) & (observed > 0.05) & (observed < 10.0)
+    tolerance = np.maximum(
+        SURFACE_ABS_TOLERANCE_M, SURFACE_REL_TOLERANCE * expected
     )
-    consistency = float(consistent.sum() / max(int(usable.sum()), 1))
+    delta = observed - expected
+    supported = usable & (np.abs(delta) <= tolerance)
+    occluding = usable & (delta < -tolerance)
+    behind = usable & (delta > tolerance)
+    usable_count = int(usable.sum())
+    supported_count = int(supported.sum())
+    coverage = float(usable_count / visible_pixels)
+    agreement = float(supported_count / visible_pixels)
+    agreement_of_depth = float(supported_count / max(usable_count, 1))
+    missing_ratio = float(1.0 - coverage)
+    occlusion_ratio = float(occluding.sum() / visible_pixels)
+    behind_ratio = float(behind.sum() / visible_pixels)
 
     fresh_score = float(np.clip(1.0 - age / max_age_s, 0.0, 1.0))
-    area_score = float(np.clip(visible_pixels / 4000.0, 0.0, 1.0))
-    coverage_score = float(np.clip(coverage / 0.5, 0.0, 1.0))
-    quality = float(np.clip(fresh_score * (
-        0.25 * overlap + 0.20 * area_score
-        + 0.20 * coverage_score + 0.35 * consistency
-    ),
+    overlap_score = float(np.clip(rendered.image_overlap / 0.80, 0.0, 1.0))
+    area_score = float(np.clip(visible_pixels / 1500.0, 0.0, 1.0))
+    coverage_score = float(np.clip(coverage / 0.80, 0.0, 1.0))
+    agreement_score = float(np.clip(agreement / 0.80, 0.0, 1.0))
+    quality = float(np.clip(
+        fresh_score * (
+            0.10 * overlap_score + 0.10 * area_score
+            + 0.10 * coverage_score
+            + 0.70 * agreement_score
+        ) * max(0.0, 1.0 - 0.35 * occlusion_ratio - 0.50 * behind_ratio),
         0.0, 1.0,
     ))
-    checks = (
-        (age <= max_age_s, "stale"),
-        (overlap >= 0.30, "outside image"),
-        (visible_pixels >= 200, "projection too small"),
-        (coverage >= 0.10, "insufficient depth"),
-        (consistency >= 0.50, "depth mismatch"),
+
+    tracking = (
+        age <= max_age_s
+        and rendered.image_overlap >= TRACKING_MIN_OVERLAP
+        and visible_pixels >= TRACKING_MIN_VISIBLE_PIXELS
+        and coverage >= TRACKING_MIN_DEPTH_COVERAGE
+        and agreement >= TRACKING_MIN_SURFACE_AGREEMENT
+        and agreement_of_depth >= TRACKING_MIN_AGREEMENT_OF_DEPTH
+        and occlusion_ratio <= TRACKING_MAX_OCCLUSION
+        and behind_ratio <= TRACKING_MAX_BEHIND
     )
-    reason = next((reason for passed, reason in checks if not passed), "ok")
+    partial = (
+        age <= max_age_s
+        and rendered.image_overlap >= PARTIAL_MIN_OVERLAP
+        and visible_pixels >= PARTIAL_MIN_VISIBLE_PIXELS
+        and coverage >= PARTIAL_MIN_DEPTH_COVERAGE
+        and agreement >= PARTIAL_MIN_SURFACE_AGREEMENT
+        and agreement_of_depth >= PARTIAL_MIN_AGREEMENT_OF_DEPTH
+    )
+    if tracking:
+        state, reason = TRACKING, "strong surface support"
+    elif partial:
+        state, reason = PARTIAL, "partial surface support"
+    else:
+        state = LOST
+        if age > max_age_s:
+            reason = "stale"
+        elif rendered.image_overlap < PARTIAL_MIN_OVERLAP:
+            reason = "outside image"
+        elif visible_pixels < PARTIAL_MIN_VISIBLE_PIXELS:
+            reason = "projection too small"
+        elif coverage < PARTIAL_MIN_DEPTH_COVERAGE:
+            reason = "insufficient depth"
+        else:
+            reason = "surface depth mismatch"
+        quality = 0.0
     return PoseValidity(
-        reason == "ok", quality, age, center_z, overlap, projected_area,
-        coverage, consistency, reason,
+        state, quality, age, center_z, rendered.image_overlap,
+        rendered.projected_area_px, float(visible_pixels), coverage, agreement,
+        agreement_of_depth, missing_ratio, occlusion_ratio, behind_ratio,
+        supported_count, reason,
     )
 
 
@@ -348,14 +524,11 @@ class FusionResult:
     pose: Optional[np.ndarray]
     valid: bool
     source: str
-    held: bool = False
 
 
 def fuse_world_poses(
     external_pose: Optional[np.ndarray], external_valid: bool, external_quality: float,
     g1_pose: Optional[np.ndarray], g1_valid: bool, g1_quality: float,
-    *, last_pose: Optional[np.ndarray] = None, last_pose_time: float = 0.0,
-    now: float = 0.0, hold_s: float = 0.25,
 ) -> FusionResult:
     if external_valid and external_pose is not None and g1_valid and g1_pose is not None:
         ext = validate_transform(external_pose, "external_pose")
@@ -374,8 +547,6 @@ def fuse_world_poses(
         return FusionResult(validate_transform(external_pose, "external_pose").copy(), True, "EXTERNAL")
     if g1_valid and g1_pose is not None:
         return FusionResult(validate_transform(g1_pose, "g1_pose").copy(), True, "G1")
-    if last_pose is not None and float(now) - float(last_pose_time) <= hold_s:
-        return FusionResult(validate_transform(last_pose, "last_pose").copy(), True, "NONE", True)
     return FusionResult(None, False, "NONE")
 
 
